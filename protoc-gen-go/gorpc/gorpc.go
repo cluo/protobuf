@@ -32,7 +32,7 @@
 // Package grpc outputs gRPC service descriptions in Go code.
 // It runs as a plugin for the Go protocol buffer compiler plugin.
 // It is linked in to protoc-gen-go.
-package grpc
+package gorpc
 
 import (
 	"fmt"
@@ -69,7 +69,7 @@ type grpc struct {
 
 // Name returns the name of this plugin, "grpc".
 func (g *grpc) Name() string {
-	return "grpc"
+	return "gorpc"
 }
 
 // The names for packages imported in the generated code.
@@ -132,6 +132,9 @@ func (g *grpc) GenerateImports(file *generator.FileDescriptor) {
 	g.P("import (")
 	g.P(contextPkg, " ", strconv.Quote(path.Join(g.gen.ImportPrefix, contextPkgPath)))
 	g.P(grpcPkg, " ", strconv.Quote(path.Join(g.gen.ImportPrefix, grpcPkgPath)))
+	g.P(strconv.Quote("time"))
+	g.P(strconv.Quote("encoding/json"))
+	g.P(strconv.Quote("log"))
 	g.P(")")
 	g.P()
 }
@@ -167,34 +170,7 @@ func (g *grpc) generateService(file *generator.FileDescriptor, service *pb.Servi
 	g.P("}")
 	g.P()
 
-	// Client structure.
-	g.P("type ", unexport(servName), "Client struct {")
-	g.P("cc *", grpcPkg, ".ClientConn")
-	g.P("}")
-	g.P()
-
-	// NewClient factory.
-	g.P("func New", servName, "Client (cc *", grpcPkg, ".ClientConn) ", servName, "Client {")
-	g.P("return &", unexport(servName), "Client{cc}")
-	g.P("}")
-	g.P()
-
-	var methodIndex, streamIndex int
-	serviceDescVar := "_" + servName + "_serviceDesc"
-	// Client method implementations.
-	for _, method := range service.Method {
-		var descExpr string
-		if !method.GetServerStreaming() && !method.GetClientStreaming() {
-			// Unary RPC method
-			descExpr = fmt.Sprintf("&%s.Methods[%d]", serviceDescVar, methodIndex)
-			methodIndex++
-		} else {
-			// Streaming RPC method
-			descExpr = fmt.Sprintf("&%s.Streams[%d]", serviceDescVar, streamIndex)
-			streamIndex++
-		}
-		g.generateClientMethod(servName, fullServName, serviceDescVar, method, descExpr)
-	}
+	g, servName, serviceDescVar, service, fullServName := genGrpcClient(g, servName, service, fullServName)
 
 	g.P("// Server API for ", servName, " service")
 	g.P()
@@ -259,6 +235,88 @@ func (g *grpc) generateService(file *generator.FileDescriptor, service *pb.Servi
 	g.P()
 }
 
+//func genAsynGrpcClient(g *grpc, servName string, service *pb.ServiceDescriptorProto, fullServName string) (*grpc, string, string, *pb.ServiceDescriptorProto, string) {
+//	// Client structure.
+//	g.P("type ", unexport(servName), "Client struct {")
+//	g.P("cc *", grpcPkg, ".ClientConn")
+//	g.P("}")
+//	g.P()
+//	// NewClient factory.
+//	g.P("func New", servName, "Client (cc *", grpcPkg, ".ClientConn) ", servName, "Client {")
+//	g.P("return &", unexport(servName), "Client{cc}")
+//	g.P("}")
+//	g.P()
+//	var methodIndex, streamIndex int
+//	serviceDescVar := "_" + servName + "_serviceDesc"
+//	// Client method implementations.
+//	for _, method := range service.Method {
+//		var descExpr string
+//		if !method.GetServerStreaming() && !method.GetClientStreaming() {
+//			// Unary RPC method
+//			descExpr = fmt.Sprintf("&%s.Methods[%d]", serviceDescVar, methodIndex)
+//			methodIndex++
+//		} else {
+//			// Streaming RPC method
+//			descExpr = fmt.Sprintf("&%s.Streams[%d]", serviceDescVar, streamIndex)
+//			streamIndex++
+//		}
+//		g.generateClientMethod(servName, fullServName, serviceDescVar, method, descExpr)
+//	}
+//	return g, servName, serviceDescVar, service, fullServName
+//}
+
+func genGrpcClient(g *grpc, servName string, service *pb.ServiceDescriptorProto, fullServName string) (*grpc, string, string, *pb.ServiceDescriptorProto, string) {
+	// Client structure.
+	g.P("type ", unexport(servName), "Client struct {")
+	g.P("cc *", grpcPkg, ".ClientConn")
+	g.P("}")
+	g.P()
+	// NewClient factory.
+	g.P("func New", servName, "Client (cc *", grpcPkg, ".ClientConn) ", servName, "Client {")
+	g.P("return &", unexport(servName), "Client{cc}")
+	g.P("}")
+	g.P()
+	var methodIndex, streamIndex int
+	serviceDescVar := "_" + servName + "_serviceDesc"
+	// Client method implementations.
+	for _, method := range service.Method {
+		var descExpr string
+		if !method.GetServerStreaming() && !method.GetClientStreaming() {
+			// Unary RPC method
+			descExpr = fmt.Sprintf("&%s.Methods[%d]", serviceDescVar, methodIndex)
+			methodIndex++
+		} else {
+			// Streaming RPC method
+			descExpr = fmt.Sprintf("&%s.Streams[%d]", serviceDescVar, streamIndex)
+			streamIndex++
+		}
+		g.generateClientMethod(servName, fullServName, serviceDescVar, method, descExpr)
+
+		g.generateClientAsynMethod(servName, fullServName, serviceDescVar, method, descExpr)
+
+	}
+
+	return g, servName, serviceDescVar, service, fullServName
+}
+
+// generateClientSignature returns the client-side signature for a method.
+func (g *grpc) generateAsynClientSignature(servName string, method *pb.MethodDescriptorProto) string {
+	origMethName := method.GetName()
+	methName := generator.CamelCase(origMethName) + "Asyn"
+	if reservedClientName[methName] {
+		methName += "_"
+	}
+	reqArg := ", in *" + g.typeName(method.GetInputType())
+	if method.GetClientStreaming() {
+		reqArg = ""
+	}
+	respName := "*" + g.typeName(method.GetOutputType())
+	if method.GetServerStreaming() || method.GetClientStreaming() {
+		respName = servName + "_" + generator.CamelCase(origMethName) + "Client"
+	}
+	return fmt.Sprintf("%s(ctx %s.Context%s, opts ...%s.CallOption) (chan %s,chan error)", methName, contextPkg, reqArg, grpcPkg, respName)
+}
+
 // generateClientSignature returns the client-side signature for a method.
 func (g *grpc) generateClientSignature(servName string, method *pb.MethodDescriptorProto) string {
 	origMethName := method.GetName()
@@ -277,6 +335,88 @@ func (g *grpc) generateClientSignature(servName string, method *pb.MethodDescrip
 	return fmt.Sprintf("%s(ctx %s.Context%s, opts ...%s.CallOption) (%s, error)", methName, contextPkg, reqArg, grpcPkg, respName)
 }
 
+func (g *grpc) generateClientAsynMethod(servName, fullServName, serviceDescVar string, method *pb.MethodDescriptorProto, descExpr string) {
+	sname := fmt.Sprintf("/%s/%s", fullServName, method.GetName())
+	methName := generator.CamelCase(method.GetName())
+	//asynMethodName := generator.CamelCase(method.GetName())+"Asyn"
+	inType := g.typeName(method.GetInputType())
+	outType := g.typeName(method.GetOutputType())
+
+	g.P("func (c *", unexport(servName), "Client) ", g.generateAsynClientSignature(servName, method), "{")
+	if !method.GetServerStreaming() && !method.GetClientStreaming() {
+		g.P(`respChan := make(chan *` + outType + `, 1)
+	errChan := make(chan error, 1)
+	go func() {
+		out, err := c.` + methName + `(ctx, in)
+		respChan <- out
+		errChan <- err
+	}()
+	return respChan, errChan
+	}`)
+		g.P()
+		return
+	}
+	streamType := unexport(servName) + methName + "Client"
+	g.P("stream, err := ", grpcPkg, ".NewClientStream(ctx, ", descExpr, `, c.cc, "`, sname, `", opts...)`)
+	g.P("if err != nil { return nil, err }")
+	g.P("x := &", streamType, "{stream}")
+	if !method.GetClientStreaming() {
+		g.P("if err := x.ClientStream.SendMsg(in); err != nil { return nil, err }")
+		g.P("if err := x.ClientStream.CloseSend(); err != nil { return nil, err }")
+	}
+	g.P("return x, nil")
+	g.P("}")
+	g.P()
+
+	genSend := method.GetClientStreaming()
+	genRecv := method.GetServerStreaming()
+	genCloseAndRecv := !method.GetServerStreaming()
+
+	// Stream auxiliary types and methods.
+	g.P("type ", servName, "_", methName, "Client interface {")
+	if genSend {
+		g.P("Send(*", inType, ") error")
+	}
+	if genRecv {
+		g.P("Recv() (*", outType, ", error)")
+	}
+	if genCloseAndRecv {
+		g.P("CloseAndRecv() (*", outType, ", error)")
+	}
+	g.P(grpcPkg, ".ClientStream")
+	g.P("}")
+	g.P()
+
+	g.P("type ", streamType, " struct {")
+	g.P(grpcPkg, ".ClientStream")
+	g.P("}")
+	g.P()
+
+	if genSend {
+		g.P("func (x *", streamType, ") Send(m *", inType, ") error {")
+		g.P("return x.ClientStream.SendMsg(m)")
+		g.P("}")
+		g.P()
+	}
+	if genRecv {
+		g.P("func (x *", streamType, ") Recv() (*", outType, ", error) {")
+		g.P("m := new(", outType, ")")
+		g.P("if err := x.ClientStream.RecvMsg(m); err != nil { return nil, err }")
+		g.P("return m, nil")
+		g.P("}")
+		g.P()
+	}
+	if genCloseAndRecv {
+		g.P("func (x *", streamType, ") CloseAndRecv() (*", outType, ", error) {")
+		g.P("if err := x.ClientStream.CloseSend(); err != nil { return nil, err }")
+		g.P("m := new(", outType, ")")
+		g.P("if err := x.ClientStream.RecvMsg(m); err != nil { return nil, err }")
+		g.P("return m, nil")
+		g.P("}")
+		g.P()
+	}
+}
+
 func (g *grpc) generateClientMethod(servName, fullServName, serviceDescVar string, method *pb.MethodDescriptorProto, descExpr string) {
 	sname := fmt.Sprintf("/%s/%s", fullServName, method.GetName())
 	methName := generator.CamelCase(method.GetName())
@@ -286,8 +426,19 @@ func (g *grpc) generateClientMethod(servName, fullServName, serviceDescVar strin
 	g.P("func (c *", unexport(servName), "Client) ", g.generateClientSignature(servName, method), "{")
 	if !method.GetServerStreaming() && !method.GetClientStreaming() {
 		g.P("out := new(", outType, ")")
+		g.P("var err error")
+		g.P(`defer func(begin time.Time) {
+				requestJSON,_ := json.Marshal(in)
+				outJson, _ := json.Marshal(out)
+				log.Printf("method:` + methName + `,request:%s,took:%s,out:%+v,err:%#v\n",requestJSON,time.Since(begin),string(outJson),err)
+				defer func() {
+					if err := recover(); err != nil {
+						log.Printf("记录日志异常，rpc log exception:%s\n")
+					}
+				}()
+			}(time.Now())`)
 		// TODO: Pass descExpr to Invoke.
-		g.P("err := ", grpcPkg, `.Invoke(ctx, "`, sname, `", in, out, c.cc, opts...)`)
+		g.P("err = ", grpcPkg, `.Invoke(ctx, "`, sname, `", in, out, c.cc, opts...)`)
 		g.P("if err != nil { return nil, err }")
 		g.P("return out, nil")
 		g.P("}")
